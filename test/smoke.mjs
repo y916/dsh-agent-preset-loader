@@ -1,91 +1,204 @@
-import { mkdtempSync, cpSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
 import { apply } from '../index.mjs'
 
-const STAGING = '/home/yf/work/wsl/.preset-staging/.agent-presets'
+const PROFILE = '/home/yf/.dsh/profiles/web'
+const require = createRequire(join(PROFILE, 'package.json'))
+
+function presetYaml(id, rows) {
+  return [
+    '- id: preset-' + id,
+    '  name: "@deepseek-ai/dsh-agent-preset"',
+    '  config:',
+    '    id: ' + id,
+    '    name: ' + id,
+    '    description: preset ' + id,
+    '    plugins:',
+    ...rows.map((line) => '      ' + line),
+    '',
+  ].join('\n')
+}
+
+const SPAWN = (extra) => [
+  '- id: delegation',
+  '  name: cordis:group',
+  '  group: true',
+  '  config:',
+  '    - id: tool-subagent',
+  '      name: "@deepseek-ai/dsh-tool-subagent"',
+  '      config:',
+  '        provider: spawn',
+  ...extra.map((line) => '        ' + line),
+  '    - id: tool-subagent-fork',
+  '      name: "@deepseek-ai/dsh-tool-subagent"',
+  '      config:',
+  '        provider: fork',
+  '        toolName: subagent_fork',
+]
+
+const root = mkdtempSync(join(tmpdir(), 'preset-loader-smoke-'))
+function writePreset(id, rows) {
+  mkdirSync(join(root, id), { recursive: true })
+  writeFileSync(join(root, id, 'preset.cordis.yml'), presetYaml(id, rows))
+}
+
+// alpha: no preset keys at all -> every preset is selectable
+writePreset('alpha', SPAWN(['agentPreset: alpha']))
+// beta: explicit whitelist
+writePreset('beta', SPAWN(['agentPreset: beta', 'allowedAgentPresets:', '  - alpha']))
+// gamma: blacklist plus a default that the blacklist removes
+writePreset('gamma', SPAWN(['agentPreset: alpha', 'notAllowedAgentPresets:', '  - alpha']))
+// delta: no delegation rows at all
+writePreset('delta', ['- id: persona', '  name: "@deepseek-ai/dsh-persona"'])
+
 const registered = new Map()
+const versions = new Map()
+const tools = []
+const warnings = []
 const effects = []
-const logs = []
+
+const hostRows = [
+  { id: 'standard', name: '标准', description: 'host preset' },
+  { id: 'broken-one', broken: 'row never started' },
+]
+
 const ctx = {
-  get(name) {
-    if (name === 'profileContext') return { dir: '/home/yf/.dsh/profiles/web', home: '/home/yf/.dsh' }
-    return undefined
-  },
+  get: (name) => (name === 'profileContext' ? { dir: PROFILE, home: '/home/yf/.dsh' } : undefined),
   logger: {
-    info: (msg) => logs.push(['info', msg]),
-    warn: (msg) => logs.push(['warn', msg]),
+    info: () => {},
+    warn: (message) => warnings.push(message),
     debug: () => {},
   },
-  effect(fn) { effects.push(fn()) },
+  effect(fn) {
+    effects.push(fn())
+  },
+  inject(_deps, callback) {
+    callback(ctx)
+  },
+  tools: {
+    register(definition) {
+      tools.push(definition)
+      return () => {}
+    },
+  },
   agentPresets: {
+    get defaultId() {
+      return 'alpha'
+    },
     async register(config) {
-      if (registered.has(config.id)) throw new Error(`Duplicate agent preset: ${config.id}`)
+      if (registered.has(config.id)) throw new Error(`duplicate: ${config.id}`)
       registered.set(config.id, config)
-      return async () => { registered.delete(config.id) }
+      versions.set(config.id, (versions.get(config.id) ?? 0) + 1)
+      return async () => registered.delete(config.id)
+    },
+    async list() {
+      return [
+        ...hostRows,
+        ...[...registered.values()].map((config) => ({
+          id: config.id,
+          name: config.name,
+          description: config.description,
+        })),
+      ]
+    },
+    composedPreset(agentCtx) {
+      return agentCtx?.preset
     },
   },
 }
 
-const root = mkdtempSync(join(tmpdir(), 'preset-loader-'))
-cpSync(STAGING, root, { recursive: true })
-// one per-preset skill for the skill discovery row
-mkdirSync(join(root, 'simplified', 'demo-skill'), { recursive: true })
-writeFileSync(join(root, 'simplified', 'demo-skill', 'SKILL.md'), '---\nname: demo-skill\ndescription: demo\n---\n\n# demo\n')
-
-await apply(ctx, { root, watch: false })
-
-const ids = [...registered.keys()].sort()
-console.log('registered:', ids)
-if (ids.join(',') !== 'director,simplified,translation-agent') throw new Error('unexpected preset ids')
-
-const simplified = registered.get('simplified')
-const director = registered.get('director')
-const translation = registered.get('translation-agent')
-
-const names = (config) => {
-  const out = []
-  const walk = (rows) => {
-    for (const row of rows) {
-      if (typeof row.name === 'string') out.push(row.name)
+const toolRows = (config) => {
+  const rows = []
+  const walk = (plugins) => {
+    for (const row of plugins) {
+      if (row.name === '@deepseek-ai/dsh-tool-subagent') rows.push(row)
       if (Array.isArray(row.config)) walk(row.config)
     }
   }
   walk(config.plugins)
-  return out
+  return rows
 }
 
-const sNames = names(simplified)
-console.log('simplified rows:', sNames.length)
-if (!sNames.includes('@deepseek-ai/dsh-tool-skill')) throw new Error('simplified lost tool-skill')
-if (!sNames.includes('@deepseek-ai/dsh-skill-filesystem')) throw new Error('simplified missing scoped skill provider')
-const provider = simplified.plugins.find((row) => row.name === '@deepseek-ai/dsh-skill-filesystem' && row.config?.providerName)
-if (!provider || provider.config.customSkillDirs[0] !== join(root, 'simplified')) throw new Error('skill provider misconfigured')
-if (!provider.config.providerName.startsWith('agent-preset-simplified')) throw new Error('skill provider name')
+const spawnRow = (config) => toolRows(config).find((row) => row.config?.provider === 'spawn')
+const forkRow = (config) => toolRows(config).find((row) => row.config?.provider === 'fork')
 
-const dNames = names(director)
-if (!dNames.includes(`file://${join(root, 'director', 'tool-deny.mjs')}`)) throw new Error('director tool-deny not auto-mounted')
-if (!dNames.includes('@deepseek-ai/dsh-tool-skill')) throw new Error('director lost tool-skill')
-const jsExpr = JSON.stringify(director.plugins).includes('__jsExpr')
-if (!jsExpr) throw new Error('!!js expressions were not preserved')
+try {
+  await apply(ctx, { root })
 
-const tNames = names(translation)
-if (!tNames.includes(`file://${join(root, 'translation-agent', 'tool-restriction.mjs')}`)) throw new Error('translation tool-restriction not auto-mounted')
-if (tNames.includes('@deepseek-ai/dsh-tool-skill')) throw new Error('tool-free preset gained tool-skill')
+  // The first pass cannot read the Host roster from inside activation, so the
+  // allowlist starts with this loader's own directories only.
+  const initial = spawnRow(registered.get('alpha')).config.allowedAgentPresets
+  if (initial.join(',') !== 'alpha,beta,delta,gamma') throw new Error(`unexpected first-pass allowlist: ${initial}`)
 
-for (const [id, config] of registered) {
-  const allIds = []
-  const walkIds = (rows) => {
-    for (const row of rows) {
-      if (row.id !== undefined) allIds.push(row.id)
-      if (Array.isArray(row.config)) walkIds(row.config)
+  // The deferred roster refresh picks up presets registered by other layers
+  // and re-registers the presets whose allowlist changed.
+  await delay(150)
+  const alpha = spawnRow(registered.get('alpha')).config
+  const roster = alpha.allowedAgentPresets
+  if (!roster.includes('standard')) throw new Error(`host preset missing from allowlist: ${roster}`)
+  if (roster.includes('broken-one')) throw new Error('broken preset leaked into the allowlist')
+  if (alpha.agentPreset !== 'alpha') throw new Error('default agentPreset was lost')
+  if (forkRow(registered.get('alpha')).config.allowedAgentPresets !== undefined) throw new Error('fork row must stay untouched')
+
+  // Whitelist and blacklist both resolve against the roster.
+  const beta = spawnRow(registered.get('beta')).config
+  if (beta.allowedAgentPresets.join(',') !== 'alpha') throw new Error(`whitelist not honored: ${beta.allowedAgentPresets}`)
+  const gamma = spawnRow(registered.get('gamma')).config
+  if (gamma.allowedAgentPresets.includes('alpha')) throw new Error('blacklist not applied')
+  if (gamma.agentPreset !== undefined) throw new Error('a blacklisted default must be dropped')
+  if (!warnings.some((line) => line.includes('is not selectable'))) throw new Error('missing warning for the dropped default')
+
+  // Every rewritten row must satisfy the core tool's own config contract.
+  const subagentModule = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href)
+  for (const [id, config] of registered) {
+    for (const row of toolRows(config)) {
+      const resolved = subagentModule.Config(row.config)
+      const allowed = resolved.allowedAgentPresets
+      if (allowed === undefined) continue
+      if (new Set(allowed).size !== allowed.length) throw new Error(`${id}: duplicate ids in allowedAgentPresets`)
+      if (resolved.agentPreset !== undefined && !allowed.includes(resolved.agentPreset)) {
+        throw new Error(`${id}: agentPreset is not part of allowedAgentPresets`)
+      }
+      if (row.config.notAllowedAgentPresets !== undefined) throw new Error(`${id}: notAllowedAgentPresets reached the core tool`)
     }
   }
-  walkIds(config.plugins)
-  const dupes = allIds.filter((rowId, index) => allIds.indexOf(rowId) !== index)
-  if (dupes.length) throw new Error(`duplicate row ids in ${id}: ${dupes.join(',')}`)
-}
 
-console.log('logs:', logs.length ? logs.slice(0, 3) : 'none')
-console.log('SMOKE TEST PASSED')
-rmSync(root, { recursive: true, force: true })
+  // The roster tool: definition shape, then per-caller filtering.
+  if (tools.length !== 1 || tools[0].name !== 'list_agent_presets') throw new Error(`unexpected tools: ${tools.map((tool) => tool.name)}`)
+  const definition = tools[0]
+  const toolsModule = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tools')).href)
+  toolsModule.assertSupportedJsonSchema(definition.parameters)
+  toolsModule.assertObjectJsonSchema(definition.parameters)
+  toolsModule.assertSupportedJsonSchema(definition.output.schema)
+
+  const asAlpha = await definition.execute({}, { agent: { ctx: { preset: 'alpha' } } })
+  const alphaIds = asAlpha.map((row) => row.id)
+  if (!alphaIds.includes('standard') || alphaIds.includes('broken-one')) throw new Error(`roster rows wrong: ${alphaIds}`)
+  if (!asAlpha.find((row) => row.id === 'alpha')?.isDefault) throw new Error('default flag missing')
+
+  const asBeta = await definition.execute({}, { agent: { ctx: { preset: 'beta' } } })
+  if (asBeta.map((row) => row.id).join(',') !== 'alpha') throw new Error(`whitelisted caller sees ${asBeta.map((row) => row.id)}`)
+
+  const asGamma = await definition.execute({}, { agent: { ctx: { preset: 'gamma' } } })
+  if (asGamma.some((row) => row.id === 'alpha')) throw new Error('blacklisted preset shown to the caller')
+
+  const rendered = definition.output.render({}, asAlpha)
+  if (!rendered[0]?.text?.includes('standard')) throw new Error('render lost the roster')
+
+  // Removing a directory withdraws the registration on the next pass.
+  rmSync(join(root, 'delta'), { recursive: true, force: true })
+  await delay(1200)
+  if (registered.has('delta')) throw new Error('removed preset was not withdrawn')
+
+  console.log('registered:', [...registered.keys()].sort().join(','))
+  console.log('allowlist:', roster.join(','))
+  console.log('warnings:', warnings.length)
+  console.log('SMOKE TEST PASSED')
+} finally {
+  for (const dispose of effects.splice(0)) await Promise.resolve(dispose()).catch(() => {})
+  rmSync(root, { recursive: true, force: true })
+}

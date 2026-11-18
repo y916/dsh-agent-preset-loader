@@ -30,6 +30,52 @@ For each `<id>`:
    already mount one. A preset without skill directories is left untouched
    (so tool-free presets stay tool-free).
 
+## Delegation preset selection
+
+The core `@deepseek-ai/dsh-tool-subagent` only understands a concrete
+`allowedAgentPresets` whitelist. This loader adds the two declarative keys
+below on any `spawn` row and resolves them against the live preset roster:
+
+```yaml
+- id: tool-subagent
+  name: "@deepseek-ai/dsh-tool-subagent"
+  config:
+    provider: spawn
+    agentPreset: simplified          # default child preset; optional
+    # allowedAgentPresets: [simplified, standard]   # whitelist
+    # notAllowedAgentPresets: [translation-agent]   # blacklist, applied after the whitelist
+```
+
+- `allowedAgentPresets` — only these ids are selectable.
+- `notAllowedAgentPresets` — every preset except these is selectable.
+- neither key — every preset on the roster is selectable (the default).
+
+Both keys are removed from the row before registration (the core tool rejects
+unknown keys), and the resolved whitelist is written back as
+`allowedAgentPresets`. A default `agentPreset` that the resolved list does not
+contain is dropped with a warning, so children fall back to inheriting the
+parent preset instead of failing to mount. Rows whose provider inherits the
+conversation (`provider: fork`) are never touched.
+
+The roster is the union of every preset the registry reports as usable and the
+directories this loader owns. It is re-read on every directory change, and once
+more shortly after boot, when the Host tree has settled — so a preset declared
+by another bundle becomes selectable without editing each preset. A withdrawn
+directory leaves the remaining allowlists on the same pass.
+
+## `list_agent_presets`
+
+The loader also registers a read-only tool with no parameters:
+
+```
+list_agent_presets → [{ id, name, description, isDefault }, ...]
+```
+
+It answers `ctx.agentPresets.list()`, drops unusable (broken) presets, and — for
+an agent whose preset carries a resolved whitelist — returns only the ids that
+agent may actually pass to `subagent(agent_preset: ...)`. The model-facing text
+is one line per preset: `id (name) [default] — description`.
+
 ## Install
 
 ```bash
@@ -44,11 +90,27 @@ filesystem watcher. Changes to `preset.cordis.yml` or the folder set take
 effect immediately; edits inside a `SKILL.md` body are picked up by the skill
 provider itself.
 
+## Tests
+
+```bash
+node test/smoke.mjs      # registration, preset selection, the roster tool
+node test/watch.mjs      # hot reload, withdrawal, dispose
+node test/installed.mjs  # read the real $DSH_HOME/.agent-presets tree
+```
+
+`smoke.mjs` validates the rewritten rows and the tool schema against the
+installed `@deepseek-ai/dsh-tool-subagent` / `@deepseek-ai/dsh-tools` packages
+resolved from the `web` profile.
+
 ## Notes
 
 - YAML is parsed with the profile's own `js-yaml` plus a `!!js` tag, so loader
   expressions in preset rows survive registration.
 - `register()` resolves once the definition is recorded; an activation failure
   is reported by the registry roster (not thrown here). The loader never calls
-  `resolve()` inside `apply()` (that can deadlock on the Host loader).
+  `resolve()`/`list()` inside `apply()` (that can deadlock on the Host loader);
+  the roster refresh runs on a timer after activation.
 - A parse error keeps the previous registration for that id and logs a warning.
+- `config.watch: false` only disables the filesystem watcher: the post-boot
+  roster refresh still runs, so presets declared by other layers are selectable
+  without restarting. Only later directory edits then need a restart.

@@ -1,5 +1,5 @@
 /**
- * @yf/dsh-agent-preset-loader
+ * @y916/dsh-agent-preset-loader
  *
  * One directory is one agent preset:
  *
@@ -15,13 +15,36 @@
  * re-registers a preset when its files change (a full dsh restart picks up
  * everything too).
  *
- * Mount it once in the profile composition:
+ * Install it as a bundle (its own cordis.patch.yml mounts the loader):
+ *
+ *   dsh plugin --profile <profile> add github:y916/dsh-agent-preset-loader
+ *
+ * — or mount it once in the profile composition:
  *
  *   - insert:
  *       - id: local-agent-preset-loader
  *         name: file:///home/yf/.dsh/agent-preset-loader/index.mjs
  *         config:
  *           root: /home/yf/.dsh/.agent-presets
+ *
+ * ## Delegation preset selection
+ *
+ * Inside every `@deepseek-ai/dsh-tool-subagent` row of a preset, this loader
+ * resolves two model-facing keys the core tool does not understand by itself:
+ *
+ *   allowedAgentPresets: [simplified, standard]   # whitelist
+ *   notAllowedAgentPresets: [translation-agent]   # blacklist
+ *   (neither key)                                 # every registered preset
+ *
+ * Both lists are resolved against the live roster (the presets other layers
+ * already registered plus the directories this loader owns), then written back
+ * as the concrete `allowedAgentPresets` whitelist the core tool accepts. The
+ * resolution is redone whenever a directory changes and once more after boot,
+ * when the Host tree has settled, so a preset registered by another bundle is
+ * selectable without editing every preset.
+ *
+ * The plugin also registers `list_agent_presets`, a read-only tool that returns
+ * the presets the calling agent may pass to `agent_preset`.
  */
 import { createRequire } from 'node:module'
 import { readFile, readdir } from 'node:fs/promises'
@@ -35,9 +58,14 @@ export const inject = ['agentPresets']
 
 const PRESET_FILES = ['preset.cordis.yml', 'agent.cordis.yml']
 const PRESET_ROW = '@deepseek-ai/dsh-agent-preset'
+const SUBAGENT_TOOL = '@deepseek-ai/dsh-tool-subagent'
+const ALLOWED_PRESETS = 'allowedAgentPresets'
+const DENIED_PRESETS = 'notAllowedAgentPresets'
 const SKILL_PROVIDER = '@deepseek-ai/dsh-skill-filesystem'
 const SKILL_TOOL = '@deepseek-ai/dsh-tool-skill'
 const DEBOUNCE_MS = 300
+const ROSTER_REFRESH_MS = [0, 4000]
+const LIST_TOOL = 'list_agent_presets'
 
 const yamlCache = new Map()
 
@@ -204,8 +232,109 @@ async function readPreset(ctx, dir, id, yamlApi) {
   return { file, config }
 }
 
+/** Non-empty string members of a YAML list, or undefined when it is not a list. */
+function stringList(value) {
+  if (!Array.isArray(value)) return undefined
+  return value.filter((entry) => typeof entry === 'string' && entry !== '')
+}
+
+/** Visit every `@deepseek-ai/dsh-tool-subagent` row, including rows inside `cordis:group`. */
+function eachSubagentRow(plugins, visit) {
+  if (!Array.isArray(plugins)) return
+  for (const row of plugins) {
+    if (row === null || typeof row !== 'object') continue
+    if (row.name === SUBAGENT_TOOL) visit(row)
+    if (Array.isArray(row.config)) eachSubagentRow(row.config, visit)
+  }
+}
+
+/**
+ * Resolve the declarative preset-selection keys of one preset into the concrete
+ * whitelist `@deepseek-ai/dsh-tool-subagent` validates model input against.
+ *
+ * `allowedAgentPresets` is a whitelist, `notAllowedAgentPresets` a blacklist
+ * applied after it, and neither key means every preset currently on the roster.
+ * Both keys are removed from the row: the core tool rejects unknown keys.
+ *
+ * @param config - preset config being registered; its spawn rows are rewritten in place.
+ * @param roster - preset ids that currently exist and load, in roster order.
+ * @param presetId - owning preset id, for diagnostics.
+ * @param logger - loader logger.
+ * @returns ids every rewritten spawn row accepts, or undefined when the preset
+ *   declares no preset selection at all.
+ */
+function resolvePresetSelection(config, roster, presetId, logger) {
+  const choices = []
+  eachSubagentRow(config.plugins, (row) => {
+    const toolConfig = row.config
+    if (toolConfig === null || typeof toolConfig !== 'object' || Array.isArray(toolConfig)) return
+    // A provider that inherits the conversation (fork) cannot take an
+    // independent preset; leave it untouched or it refuses to mount.
+    if (toolConfig.provider === 'fork') return
+    const hasWhitelist = Array.isArray(toolConfig[ALLOWED_PRESETS])
+    const hasBlacklist = Array.isArray(toolConfig[DENIED_PRESETS])
+    const hasDefault = typeof toolConfig.agentPreset === 'string'
+    // Only rows that spawn independently get model-facing preset selection.
+    if (toolConfig.provider !== 'spawn' && !hasWhitelist && !hasBlacklist && !hasDefault) return
+
+    const whitelist = hasWhitelist ? stringList(toolConfig[ALLOWED_PRESETS]) ?? [] : undefined
+    const blacklist = hasBlacklist ? stringList(toolConfig[DENIED_PRESETS]) ?? [] : []
+    delete toolConfig[ALLOWED_PRESETS]
+    delete toolConfig[DENIED_PRESETS]
+
+    const allowed = (whitelist ?? roster).filter((id) => !blacklist.includes(id))
+    if (allowed.length === 0) {
+      logger?.warn(`agent-preset-loader: ${presetId}: preset selection resolves to no preset; leaving agent_preset unconstrained`)
+      return
+    }
+    toolConfig[ALLOWED_PRESETS] = allowed
+    if (hasDefault && !allowed.includes(toolConfig.agentPreset)) {
+      logger?.warn(`agent-preset-loader: ${presetId}: default agentPreset "${toolConfig.agentPreset}" is not selectable; children inherit the parent preset instead`)
+      delete toolConfig.agentPreset
+    }
+    choices.push(allowed)
+  })
+  if (choices.length === 0) return undefined
+  // When one preset mounts several spawn rows, only ids every row accepts are
+  // worth advertising.
+  return choices.reduce((left, right) => left.filter((id) => right.includes(id)))
+}
+
+/**
+ * Preset ids a delegated child may be placed on: the healthy registry roster
+ * plus the directories this loader is about to register.
+ *
+ * @param ctx - loader context.
+ * @param own - preset ids read from the loader root this round.
+ * @param withRegistry - read `agentPresets.list()`; false during activation,
+ *   where awaiting the Host loader can deadlock.
+ * @param logger - loader logger.
+ * @returns unique preset ids in roster order.
+ */
+async function knownPresetIds(ctx, own, withRegistry, logger) {
+  const ordered = []
+  const seen = new Set()
+  const push = (id) => {
+    if (typeof id !== 'string' || id === '' || seen.has(id)) return
+    seen.add(id)
+    ordered.push(id)
+  }
+  if (withRegistry && typeof ctx.agentPresets?.list === 'function') {
+    try {
+      for (const preset of await ctx.agentPresets.list()) {
+        if (preset?.broken !== undefined) continue
+        push(preset.id)
+      }
+    } catch (error) {
+      logger?.warn(`agent-preset-loader: cannot read the preset roster: ${error.message}`)
+    }
+  }
+  for (const id of own) push(id)
+  return ordered
+}
+
 /** Reconcile the registry against the directory: register changed presets, withdraw removed ones. */
-async function reconcile(ctx, root, yamlApi, state) {
+async function reconcile(ctx, root, yamlApi, state, withRegistry) {
   let entries
   try {
     entries = await readdir(root, { withFileTypes: true })
@@ -217,18 +346,30 @@ async function reconcile(ctx, root, yamlApi, state) {
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
     .map((entry) => entry.name)
     .sort((a, b) => a.localeCompare(b))
-  const seen = new Set()
+
+  // Parse everything first: this round's delegation allowlists have to name the
+  // presets this round registers, not only the ones already in the registry.
+  const parsed = new Map()
+  const unreadable = new Set()
   for (const id of dirs) {
-    let parsed
     try {
-      parsed = await readPreset(ctx, join(root, id), id, yamlApi)
+      const preset = await readPreset(ctx, join(root, id), id, yamlApi)
+      if (preset !== undefined) parsed.set(id, preset)
     } catch (error) {
       ctx.logger.warn(`agent-preset-loader: skipping ${id}: ${error.message}`)
-      if (state.has(id)) seen.add(id)
-      continue
+      unreadable.add(id)
     }
-    if (parsed === undefined) continue
-    const key = JSON.stringify(parsed.config)
+  }
+
+  // A registration this loader is about to withdraw must not stay advertised in
+  // the remaining presets' allowlists while the same pass re-registers them.
+  const own = new Set(parsed.keys())
+  const stale = new Set([...state.keys()].filter((id) => !own.has(id) && !unreadable.has(id)))
+  const roster = (await knownPresetIds(ctx, [...own], withRegistry, ctx.logger)).filter((id) => !stale.has(id))
+  const seen = new Set(unreadable)
+  for (const [id, { config }] of parsed) {
+    const choices = resolvePresetSelection(config, roster, id, ctx.logger)
+    const key = JSON.stringify({ config, choices })
     const previous = state.get(id)
     if (previous !== undefined && previous.key === key) {
       seen.add(id)
@@ -239,8 +380,8 @@ async function reconcile(ctx, root, yamlApi, state) {
       state.delete(id)
     }
     try {
-      const dispose = await ctx.agentPresets.register(parsed.config)
-      state.set(id, { key, config: parsed.config, dispose })
+      const dispose = await ctx.agentPresets.register(config)
+      state.set(id, { key, config, choices, dispose })
       ctx.logger.info(`agent-preset-loader: registered preset ${id}`)
     } catch (error) {
       ctx.logger.warn(`agent-preset-loader: failed to register ${id}: ${error.message}`)
@@ -263,29 +404,137 @@ async function reconcile(ctx, root, yamlApi, state) {
   }
 }
 
+/** Preset id of the agent answering a tool call, when its scope is bound to one. */
+function callerPresetId(ctx, exec) {
+  const agentCtx = exec?.agent?.ctx
+  if (agentCtx === undefined) return undefined
+  try {
+    return ctx.agentPresets.composedPreset(agentCtx)
+  } catch {
+    return undefined
+  }
+}
+
+/** The read-only `list_agent_presets` tool: the presets this agent may delegate to. */
+function listAgentPresetsDefinition(ctx, state) {
+  return {
+    name: LIST_TOOL,
+    description:
+      'List the agent presets this agent may pick for a subagent, with each preset id, display name, description, and whether it is the deployment default. Read-only and takes no arguments; call it before passing `agent_preset` to `subagent`.',
+    parameters: { type: 'object', properties: {} },
+    output: {
+      schema: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['id', 'isDefault'],
+          properties: {
+            id: { type: 'string' },
+            name: { type: 'string' },
+            description: { type: 'string' },
+            isDefault: { type: 'boolean' },
+          },
+        },
+      },
+      render: (_args, presets) => [
+        {
+          type: 'text',
+          text:
+            presets.length === 0
+              ? '(no agent preset is available to this agent)'
+              : presets
+                  .map((preset) => {
+                    const label = preset.name === undefined ? preset.id : `${preset.id} (${preset.name})`
+                    const flag = preset.isDefault ? ' [default]' : ''
+                    const detail = preset.description === undefined ? '' : ` — ${preset.description}`
+                    return `- ${label}${flag}${detail}`
+                  })
+                  .join('\n'),
+        },
+      ],
+    },
+    async execute(_args, exec) {
+      const caller = callerPresetId(ctx, exec)
+      const choices = caller === undefined ? undefined : state.get(caller)?.choices
+      const allowed = choices === undefined ? undefined : new Set(choices)
+      const defaultId = ctx.agentPresets.defaultId
+      const rows = []
+      for (const preset of await ctx.agentPresets.list()) {
+        if (preset.broken !== undefined) continue
+        if (allowed !== undefined && !allowed.has(preset.id)) continue
+        rows.push({
+          id: preset.id,
+          ...(preset.name === undefined ? {} : { name: preset.name }),
+          ...(preset.description === undefined ? {} : { description: preset.description }),
+          isDefault: preset.id === defaultId,
+        })
+      }
+      return rows
+    },
+  }
+}
+
+/** Register the roster tool once the tool service exists; tools stay optional. */
+function mountListTool(ctx, state) {
+  const definition = listAgentPresetsDefinition(ctx, state)
+  const mount = (target) => {
+    const tools = target.tools
+    if (tools === undefined || typeof tools.register !== 'function') return
+    try {
+      target.effect(() => tools.register(definition))
+    } catch (error) {
+      ctx.logger.warn(`agent-preset-loader: could not register ${LIST_TOOL}: ${error.message}`)
+    }
+  }
+  if (typeof ctx.inject === 'function') ctx.inject(['tools'], mount)
+  else if (ctx.tools !== undefined) mount(ctx)
+}
+
 export async function apply(ctx, config = {}) {
   const yamlApi = await yamlFor(ctx)
   const root = resolveRoot(ctx, config.root)
   const state = new Map()
   const closers = []
+  let timer
+  let queue = Promise.resolve()
 
   ctx.effect(() => async () => {
+    clearTimeout(timer)
     for (const closer of closers.splice(0)) closer()
     for (const previous of state.values()) await previous.dispose().catch(() => {})
     state.clear()
   })
 
-  await reconcile(ctx, root, yamlApi, state)
+  mountListTool(ctx, state)
+
+  const reload = (withRegistry) => {
+    queue = queue
+      .then(() => reconcile(ctx, root, yamlApi, state, withRegistry))
+      .catch((error) => ctx.logger.warn(`agent-preset-loader: reload failed: ${error.message}`))
+    return queue
+  }
+
+  // Never await the Host loader from inside this row's activation: the roster
+  // read below happens on a timer, after the tree has settled.
+  await reload(false)
+
+  // The Host may still be registering its own presets when this row activates;
+  // re-read the roster after the tree settled so the allowlists cover it.
+  for (const delay of ROSTER_REFRESH_MS) {
+    const refresh = setTimeout(() => {
+      void reload(true)
+    }, delay)
+    refresh.unref?.()
+    closers.push(() => clearTimeout(refresh))
+  }
 
   if (config.watch === false) return
-  let queue = Promise.resolve()
-  let timer
+
   const schedule = () => {
     clearTimeout(timer)
     timer = setTimeout(() => {
-      queue = queue
-        .then(() => reconcile(ctx, root, yamlApi, state))
-        .catch((error) => ctx.logger.warn(`agent-preset-loader: reload failed: ${error.message}`))
+      void reload(true)
     }, DEBOUNCE_MS)
     timer.unref?.()
   }
