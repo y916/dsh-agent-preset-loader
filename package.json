@@ -1,0 +1,39 @@
+{
+  "name": "@y916/dsh-agent-preset-loader",
+  "version": "0.1.0",
+  "description": "Load agent presets from $DSH_HOME/.agent-presets/<id> (preset.cordis.yml, local *.mjs, per-preset skills) and register them with the agent-preset registry.",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-preset",
+    "skills"
+  ],
+  "license": "MIT",
+  "author": "y916",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/y916/dsh-agent-preset-loader.git"
+  },
+  "homepage": "https://github.com/y916/dsh-agent-preset-loader#readme",
+  "bugs": {
+    "url": "https://github.com/y916/dsh-agent-preset-loader/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

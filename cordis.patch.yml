@@ -1,0 +1,6 @@
+# Mount the directory-backed agent-preset loader.
+# Presets live in $DSH_HOME/.agent-presets/<id>/ and need no rows in the
+# profile's own patch layer.
+- insert:
+    - id: agent-preset-loader
+      name: '@y916/dsh-agent-preset-loader'
