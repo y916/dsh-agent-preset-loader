@@ -185,6 +185,9 @@ try {
   const toolsModule = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tools')).href)
   const mounted = []
   const scopeCtx = {
+    get(name) {
+      return name === 'agentPresets' ? ctx.agentPresets : undefined
+    },
     effect(fn) {
       mounted.push(fn())
     },

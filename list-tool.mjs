@@ -15,7 +15,9 @@
  * reports the whole healthy roster instead.
  */
 export const name = 'agent-preset-list-tool'
-export const inject = ['tools', 'agentPresets']
+// `tools` is required; the preset registry is read through `ctx.get` so a preset
+// never fails to mount over a missing roster service.
+export const inject = ['tools']
 
 export const TOOL_NAME = 'list_agent_presets'
 
@@ -27,6 +29,7 @@ function stampedPresetIds(config) {
 
 function definition(ctx, presetIds) {
   const allowed = presetIds === undefined ? undefined : new Set(presetIds)
+  const registry = () => ctx.get('agentPresets')
   return {
     name: TOOL_NAME,
     description:
@@ -65,9 +68,11 @@ function definition(ctx, presetIds) {
       ],
     },
     async execute() {
-      const defaultId = ctx.agentPresets.defaultId
+      const presets = registry()
+      if (presets === undefined) return []
+      const defaultId = presets.defaultId
       const rows = []
-      for (const preset of await ctx.agentPresets.list()) {
+      for (const preset of await presets.list()) {
         if (preset.broken !== undefined) continue
         if (allowed !== undefined && !allowed.has(preset.id)) continue
         rows.push({
@@ -88,6 +93,9 @@ function definition(ctx, presetIds) {
  * @param config - row config; `presetIds` is stamped by the loader.
  */
 export function apply(ctx, config = {}) {
+  if (ctx.get('agentPresets') === undefined) {
+    ctx.logger?.warn('agent-preset-list-tool: the agent-presets service is unavailable; list_agent_presets will return nothing')
+  }
   const tool = definition(ctx, stampedPresetIds(config))
   const register = () => ctx.tools.register(tool)
   if (typeof ctx.effect === 'function') ctx.effect(register)
