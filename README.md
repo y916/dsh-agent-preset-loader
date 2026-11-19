@@ -63,18 +63,34 @@ more shortly after boot, when the Host tree has settled — so a preset declared
 by another bundle becomes selectable without editing each preset. A withdrawn
 directory leaves the remaining allowlists on the same pass.
 
-## `list_agent_presets`
+## `list_agent_presets` (opt-in per preset)
 
-The loader also registers a read-only tool with no parameters:
+Nothing registers this read-only tool automatically: the loader is mounted in the
+profile scope, so a tool registered there would be visible to every agent in the
+profile. A preset opts in by declaring the sibling entry as one of its own rows:
+
+```yaml
+- id: list-agent-presets
+  name: "@y916/dsh-agent-preset-loader/list-tool"
+```
+
+The row carries no configuration. When the loader registers the preset it stamps
+that preset's resolved delegation ids into `config.presetIds`, so the tool
+advertises exactly the ids `subagent` accepts. Declare the row in presets that
+can delegate (`subagent`, `subagent_fork`, `workflow`, `spawn_teammate`); presets
+without it never carry the extra schema.
 
 ```
 list_agent_presets → [{ id, name, description, isDefault }, ...]
 ```
 
-It answers `ctx.agentPresets.list()`, drops unusable (broken) presets, and — for
-an agent whose preset carries a resolved whitelist — returns only the ids that
-agent may actually pass to `subagent(agent_preset: ...)`. The model-facing text
-is one line per preset: `id (name) [default] — description`.
+It answers `ctx.agentPresets.list()`, drops unusable (broken) presets, and keeps
+only the stamped ids. A row that was not stamped (mounted by hand, or a preset
+whose delegation resolved to nothing — the loader warns about that case) reports
+the whole healthy roster instead. The model-facing text is one line per preset:
+`id (name) [default] — description`.
+
+Breaking change in 0.3: earlier versions registered this tool globally.
 
 ## Install
 
@@ -93,7 +109,7 @@ provider itself.
 ## Tests
 
 ```bash
-node test/smoke.mjs      # registration, preset selection, the roster tool
+node test/smoke.mjs      # registration, preset selection, roster-tool stamping + schema
 node test/watch.mjs      # hot reload, withdrawal, dispose
 node test/installed.mjs  # read the real $DSH_HOME/.agent-presets tree
 ```

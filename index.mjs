@@ -43,8 +43,15 @@
  * when the Host tree has settled, so a preset registered by another bundle is
  * selectable without editing every preset.
  *
- * The plugin also registers `list_agent_presets`, a read-only tool that returns
- * the presets the calling agent may pass to `agent_preset`.
+ * A preset that declares the sibling `list-tool` row also gets the read-only
+ * `list_agent_presets` tool, mounted in that preset's own scope:
+ *
+ *   - id: list-agent-presets
+ *     name: "@y916/dsh-agent-preset-loader/list-tool"
+ *
+ * The loader stamps the preset's selectable delegation ids into that row, so the
+ * tool advertises exactly what `subagent` accepts. Presets that do not declare
+ * the row never see the tool.
  */
 import { createRequire } from 'node:module'
 import { readFile, readdir } from 'node:fs/promises'
@@ -65,7 +72,10 @@ const SKILL_PROVIDER = '@deepseek-ai/dsh-skill-filesystem'
 const SKILL_TOOL = '@deepseek-ai/dsh-tool-skill'
 const DEBOUNCE_MS = 300
 const ROSTER_REFRESH_MS = [0, 4000]
-const LIST_TOOL = 'list_agent_presets'
+const LIST_TOOL_MODULES = [
+  '@y916/dsh-agent-preset-loader/list-tool',
+  '/dsh-agent-preset-loader/list-tool.mjs',
+]
 
 const yamlCache = new Map()
 
@@ -238,14 +248,27 @@ function stringList(value) {
   return value.filter((entry) => typeof entry === 'string' && entry !== '')
 }
 
-/** Visit every `@deepseek-ai/dsh-tool-subagent` row, including rows inside `cordis:group`. */
-function eachSubagentRow(plugins, visit) {
+/** Visit every plugin row, including rows nested inside `cordis:group`. */
+function eachRow(plugins, visit) {
   if (!Array.isArray(plugins)) return
   for (const row of plugins) {
     if (row === null || typeof row !== 'object') continue
-    if (row.name === SUBAGENT_TOOL) visit(row)
-    if (Array.isArray(row.config)) eachSubagentRow(row.config, visit)
+    visit(row)
+    if (Array.isArray(row.config)) eachRow(row.config, visit)
   }
+}
+
+/** Visit every `@deepseek-ai/dsh-tool-subagent` row, including rows inside `cordis:group`. */
+function eachSubagentRow(plugins, visit) {
+  eachRow(plugins, (row) => {
+    if (row.name === SUBAGENT_TOOL) visit(row)
+  })
+}
+
+/** Whether a row mounts the sibling `list-tool` entry of this package. */
+function isListToolRow(row) {
+  if (typeof row.name !== 'string') return false
+  return LIST_TOOL_MODULES.some((suffix) => row.name === suffix || row.name.endsWith(suffix))
 }
 
 /**
@@ -298,6 +321,36 @@ function resolvePresetSelection(config, roster, presetId, logger) {
   // When one preset mounts several spawn rows, only ids every row accepts are
   // worth advertising.
   return choices.reduce((left, right) => left.filter((id) => right.includes(id)))
+}
+
+/**
+ * Write the caller's selectable delegation ids into every `list-tool` row the
+ * preset declares, so the tool advertises exactly what `subagent` accepts.
+ *
+ * A declared row in a preset with no resolved delegation keeps no stamp and
+ * falls back to the whole roster; that combination is almost always a mistake,
+ * so it is warned about rather than hidden.
+ *
+ * @param config - preset config being registered; its `list-tool` rows are stamped in place.
+ * @param presetId - owning preset id, for diagnostics.
+ * @param choices - ids every spawn row of this preset accepts, or undefined.
+ * @param logger - loader logger.
+ */
+function stampListTool(config, presetId, choices, logger) {
+  eachRow(config.plugins, (row) => {
+    if (!isListToolRow(row)) return
+    const current = row.config
+    const next = current !== null && typeof current === 'object' && !Array.isArray(current) ? { ...current } : {}
+    if (choices === undefined) {
+      delete next.presetIds
+      logger?.warn(
+        `agent-preset-loader: ${presetId}: declares list_agent_presets but selects no delegation presets; it will list the whole roster`,
+      )
+    } else {
+      next.presetIds = [...choices]
+    }
+    row.config = next
+  })
 }
 
 /**
@@ -369,6 +422,7 @@ async function reconcile(ctx, root, yamlApi, state, withRegistry) {
   const seen = new Set(unreadable)
   for (const [id, { config }] of parsed) {
     const choices = resolvePresetSelection(config, roster, id, ctx.logger)
+    stampListTool(config, id, choices, ctx.logger)
     const key = JSON.stringify({ config, choices })
     const previous = state.get(id)
     if (previous !== undefined && previous.key === key) {
@@ -404,93 +458,6 @@ async function reconcile(ctx, root, yamlApi, state, withRegistry) {
   }
 }
 
-/** Preset id of the agent answering a tool call, when its scope is bound to one. */
-function callerPresetId(ctx, exec) {
-  const agentCtx = exec?.agent?.ctx
-  if (agentCtx === undefined) return undefined
-  try {
-    return ctx.agentPresets.composedPreset(agentCtx)
-  } catch {
-    return undefined
-  }
-}
-
-/** The read-only `list_agent_presets` tool: the presets this agent may delegate to. */
-function listAgentPresetsDefinition(ctx, state) {
-  return {
-    name: LIST_TOOL,
-    description:
-      'List the agent presets this agent may pick for a subagent, with each preset id, display name, description, and whether it is the deployment default. Read-only and takes no arguments; call it before passing `agent_preset` to `subagent`.',
-    parameters: { type: 'object', properties: {} },
-    output: {
-      schema: {
-        type: 'array',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['id', 'isDefault'],
-          properties: {
-            id: { type: 'string' },
-            name: { type: 'string' },
-            description: { type: 'string' },
-            isDefault: { type: 'boolean' },
-          },
-        },
-      },
-      render: (_args, presets) => [
-        {
-          type: 'text',
-          text:
-            presets.length === 0
-              ? '(no agent preset is available to this agent)'
-              : presets
-                  .map((preset) => {
-                    const label = preset.name === undefined ? preset.id : `${preset.id} (${preset.name})`
-                    const flag = preset.isDefault ? ' [default]' : ''
-                    const detail = preset.description === undefined ? '' : ` — ${preset.description}`
-                    return `- ${label}${flag}${detail}`
-                  })
-                  .join('\n'),
-        },
-      ],
-    },
-    async execute(_args, exec) {
-      const caller = callerPresetId(ctx, exec)
-      const choices = caller === undefined ? undefined : state.get(caller)?.choices
-      const allowed = choices === undefined ? undefined : new Set(choices)
-      const defaultId = ctx.agentPresets.defaultId
-      const rows = []
-      for (const preset of await ctx.agentPresets.list()) {
-        if (preset.broken !== undefined) continue
-        if (allowed !== undefined && !allowed.has(preset.id)) continue
-        rows.push({
-          id: preset.id,
-          ...(preset.name === undefined ? {} : { name: preset.name }),
-          ...(preset.description === undefined ? {} : { description: preset.description }),
-          isDefault: preset.id === defaultId,
-        })
-      }
-      return rows
-    },
-  }
-}
-
-/** Register the roster tool once the tool service exists; tools stay optional. */
-function mountListTool(ctx, state) {
-  const definition = listAgentPresetsDefinition(ctx, state)
-  const mount = (target) => {
-    const tools = target.tools
-    if (tools === undefined || typeof tools.register !== 'function') return
-    try {
-      target.effect(() => tools.register(definition))
-    } catch (error) {
-      ctx.logger.warn(`agent-preset-loader: could not register ${LIST_TOOL}: ${error.message}`)
-    }
-  }
-  if (typeof ctx.inject === 'function') ctx.inject(['tools'], mount)
-  else if (ctx.tools !== undefined) mount(ctx)
-}
-
 export async function apply(ctx, config = {}) {
   const yamlApi = await yamlFor(ctx)
   const root = resolveRoot(ctx, config.root)
@@ -505,8 +472,6 @@ export async function apply(ctx, config = {}) {
     for (const previous of state.values()) await previous.dispose().catch(() => {})
     state.clear()
   })
-
-  mountListTool(ctx, state)
 
   const reload = (withRegistry) => {
     queue = queue

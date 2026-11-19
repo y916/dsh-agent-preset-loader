@@ -1,15 +1,17 @@
 {
   "name": "@y916/dsh-agent-preset-loader",
-  "version": "0.2.0",
-  "description": "Load agent presets from $DSH_HOME/.agent-presets/<id> (preset.cordis.yml, local *.mjs, per-preset skills), resolve their delegation preset allow/deny lists, and expose list_agent_presets.",
+  "version": "0.3.0",
+  "description": "Load agent presets from $DSH_HOME/.agent-presets/<id> (preset.cordis.yml, local *.mjs, per-preset skills), resolve their delegation preset allow/deny lists, and mount a declared list_agent_presets tool.",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
     ".": "./index.mjs",
+    "./list-tool": "./list-tool.mjs",
     "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",
+    "list-tool.mjs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"

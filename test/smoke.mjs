@@ -5,9 +5,11 @@ import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
 import { apply } from '../index.mjs'
+import { apply as applyListTool } from '../list-tool.mjs'
 
 const PROFILE = '/home/yf/.dsh/profiles/web'
 const require = createRequire(join(PROFILE, 'package.json'))
+const LIST_TOOL_MODULE = '@y916/dsh-agent-preset-loader/list-tool'
 
 function presetYaml(id, rows) {
   return [
@@ -40,24 +42,25 @@ const SPAWN = (extra) => [
   '        toolName: subagent_fork',
 ]
 
+const LIST_ROW = ['- id: list-agent-presets', `  name: "${LIST_TOOL_MODULE}"`]
+
 const root = mkdtempSync(join(tmpdir(), 'preset-loader-smoke-'))
 function writePreset(id, rows) {
   mkdirSync(join(root, id), { recursive: true })
   writeFileSync(join(root, id, 'preset.cordis.yml'), presetYaml(id, rows))
 }
 
-// alpha: no preset keys at all -> every preset is selectable
-writePreset('alpha', SPAWN(['agentPreset: alpha']))
-// beta: explicit whitelist
-writePreset('beta', SPAWN(['agentPreset: beta', 'allowedAgentPresets:', '  - alpha']))
-// gamma: blacklist plus a default that the blacklist removes
+// alpha: no preset keys at all -> every preset is selectable; declares the roster tool.
+writePreset('alpha', [...SPAWN(['agentPreset: alpha']), ...LIST_ROW])
+// beta: explicit whitelist, declares the roster tool.
+writePreset('beta', [...SPAWN(['agentPreset: beta', 'allowedAgentPresets:', '  - alpha']), ...LIST_ROW])
+// gamma: blacklist plus a default that the blacklist removes; declares nothing.
 writePreset('gamma', SPAWN(['agentPreset: alpha', 'notAllowedAgentPresets:', '  - alpha']))
-// delta: no delegation rows at all
-writePreset('delta', ['- id: persona', '  name: "@deepseek-ai/dsh-persona"'])
+// delta: no delegation rows at all, but declares the roster tool (a mistake we warn about).
+writePreset('delta', ['- id: persona', '  name: "@deepseek-ai/dsh-persona"', ...LIST_ROW])
 
 const registered = new Map()
 const versions = new Map()
-const tools = []
 const warnings = []
 const effects = []
 
@@ -66,6 +69,8 @@ const hostRows = [
   { id: 'broken-one', broken: 'row never started' },
 ]
 
+// The loader itself needs no tool service any more: the roster tool lives in the
+// preset scope of the presets that declare it.
 const ctx = {
   get: (name) => (name === 'profileContext' ? { dir: PROFILE, home: '/home/yf/.dsh' } : undefined),
   logger: {
@@ -75,15 +80,6 @@ const ctx = {
   },
   effect(fn) {
     effects.push(fn())
-  },
-  inject(_deps, callback) {
-    callback(ctx)
-  },
-  tools: {
-    register(definition) {
-      tools.push(definition)
-      return () => {}
-    },
   },
   agentPresets: {
     get defaultId() {
@@ -111,11 +107,11 @@ const ctx = {
   },
 }
 
-const toolRows = (config) => {
+const rowsNamed = (config, name) => {
   const rows = []
   const walk = (plugins) => {
     for (const row of plugins) {
-      if (row.name === '@deepseek-ai/dsh-tool-subagent') rows.push(row)
+      if (row.name === name) rows.push(row)
       if (Array.isArray(row.config)) walk(row.config)
     }
   }
@@ -123,8 +119,9 @@ const toolRows = (config) => {
   return rows
 }
 
-const spawnRow = (config) => toolRows(config).find((row) => row.config?.provider === 'spawn')
-const forkRow = (config) => toolRows(config).find((row) => row.config?.provider === 'fork')
+const spawnRow = (config) => rowsNamed(config, '@deepseek-ai/dsh-tool-subagent').find((row) => row.config?.provider === 'spawn')
+const forkRow = (config) => rowsNamed(config, '@deepseek-ai/dsh-tool-subagent').find((row) => row.config?.provider === 'fork')
+const listRow = (config) => rowsNamed(config, LIST_TOOL_MODULE)[0]
 
 try {
   await apply(ctx, { root })
@@ -133,6 +130,8 @@ try {
   // allowlist starts with this loader's own directories only.
   const initial = spawnRow(registered.get('alpha')).config.allowedAgentPresets
   if (initial.join(',') !== 'alpha,beta,delta,gamma') throw new Error(`unexpected first-pass allowlist: ${initial}`)
+  const initialStamp = listRow(registered.get('alpha')).config.presetIds
+  if (initialStamp.join(',') !== 'alpha,beta,delta,gamma') throw new Error(`unexpected first-pass stamp: ${initialStamp}`)
 
   // The deferred roster refresh picks up presets registered by other layers
   // and re-registers the presets whose allowlist changed.
@@ -144,18 +143,33 @@ try {
   if (alpha.agentPreset !== 'alpha') throw new Error('default agentPreset was lost')
   if (forkRow(registered.get('alpha')).config.allowedAgentPresets !== undefined) throw new Error('fork row must stay untouched')
 
+  // The roster tool row is stamped with exactly the ids the spawn row accepts.
+  const alphaStamp = listRow(registered.get('alpha')).config.presetIds
+  if (alphaStamp.join(',') !== roster.join(',')) throw new Error(`stamp ${alphaStamp} != allowlist ${roster}`)
+
   // Whitelist and blacklist both resolve against the roster.
   const beta = spawnRow(registered.get('beta')).config
   if (beta.allowedAgentPresets.join(',') !== 'alpha') throw new Error(`whitelist not honored: ${beta.allowedAgentPresets}`)
+  if (listRow(registered.get('beta')).config.presetIds.join(',') !== 'alpha') throw new Error('whitelist stamp not honored')
   const gamma = spawnRow(registered.get('gamma')).config
   if (gamma.allowedAgentPresets.includes('alpha')) throw new Error('blacklist not applied')
   if (gamma.agentPreset !== undefined) throw new Error('a blacklisted default must be dropped')
   if (!warnings.some((line) => line.includes('is not selectable'))) throw new Error('missing warning for the dropped default')
 
+  // A preset without the row is not given one, and a declared row without
+  // delegation is warned about instead of silently listing everything.
+  if (listRow(registered.get('gamma')) !== undefined) throw new Error('the loader must not inject the roster tool row')
+  const deltaRow = listRow(registered.get('delta'))
+  if (deltaRow === undefined) throw new Error('the declared roster tool row disappeared')
+  if (deltaRow.config.presetIds !== undefined) throw new Error('a delegation-free preset must not be stamped')
+  if (!warnings.some((line) => line.includes('selects no delegation presets'))) {
+    throw new Error('missing warning for a roster tool without delegation')
+  }
+
   // Every rewritten row must satisfy the core tool's own config contract.
   const subagentModule = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href)
   for (const [id, config] of registered) {
-    for (const row of toolRows(config)) {
+    for (const row of rowsNamed(config, '@deepseek-ai/dsh-tool-subagent')) {
       const resolved = subagentModule.Config(row.config)
       const allowed = resolved.allowedAgentPresets
       if (allowed === undefined) continue
@@ -167,27 +181,42 @@ try {
     }
   }
 
-  // The roster tool: definition shape, then per-caller filtering.
-  if (tools.length !== 1 || tools[0].name !== 'list_agent_presets') throw new Error(`unexpected tools: ${tools.map((tool) => tool.name)}`)
-  const definition = tools[0]
+  // The roster tool module itself: schema validity, stamped filtering, fallback.
   const toolsModule = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tools')).href)
-  toolsModule.assertSupportedJsonSchema(definition.parameters)
-  toolsModule.assertObjectJsonSchema(definition.parameters)
-  toolsModule.assertSupportedJsonSchema(definition.output.schema)
+  const mounted = []
+  const scopeCtx = {
+    effect(fn) {
+      mounted.push(fn())
+    },
+    tools: {
+      register(tool) {
+        mounted.push(tool)
+        return () => {}
+      },
+    },
+    agentPresets: ctx.agentPresets,
+  }
 
-  const asAlpha = await definition.execute({}, { agent: { ctx: { preset: 'alpha' } } })
-  const alphaIds = asAlpha.map((row) => row.id)
-  if (!alphaIds.includes('standard') || alphaIds.includes('broken-one')) throw new Error(`roster rows wrong: ${alphaIds}`)
-  if (!asAlpha.find((row) => row.id === 'alpha')?.isDefault) throw new Error('default flag missing')
+  applyListTool(scopeCtx, { presetIds: alphaStamp })
+  const stamped = mounted.find((entry) => entry?.name === 'list_agent_presets')
+  if (stamped === undefined) throw new Error('the roster tool did not register')
+  toolsModule.assertSupportedJsonSchema(stamped.parameters)
+  toolsModule.assertObjectJsonSchema(stamped.parameters)
+  toolsModule.assertSupportedJsonSchema(stamped.output.schema)
 
-  const asBeta = await definition.execute({}, { agent: { ctx: { preset: 'beta' } } })
-  if (asBeta.map((row) => row.id).join(',') !== 'alpha') throw new Error(`whitelisted caller sees ${asBeta.map((row) => row.id)}`)
+  const filtered = await stamped.execute({}, {})
+  const ids = (rows) => rows.map((row) => row.id).sort().join(',')
+  if (ids(filtered) !== [...alphaStamp].sort().join(',')) {
+    throw new Error(`stamped roster rows wrong: ${filtered.map((row) => row.id)}`)
+  }
+  if (!filtered.find((row) => row.id === 'alpha')?.isDefault) throw new Error('default flag missing')
+  if (filtered.some((row) => row.id === 'broken-one')) throw new Error('broken preset leaked into the roster tool')
+  if (!stamped.output.render({}, filtered)[0]?.text?.includes('标准')) throw new Error('render lost the roster')
 
-  const asGamma = await definition.execute({}, { agent: { ctx: { preset: 'gamma' } } })
-  if (asGamma.some((row) => row.id === 'alpha')) throw new Error('blacklisted preset shown to the caller')
-
-  const rendered = definition.output.render({}, asAlpha)
-  if (!rendered[0]?.text?.includes('standard')) throw new Error('render lost the roster')
+  applyListTool(scopeCtx, {})
+  const unstamped = mounted.filter((entry) => entry?.name === 'list_agent_presets')[1]
+  const whole = await unstamped.execute({}, {})
+  if (!whole.some((row) => row.id === 'beta')) throw new Error('an unstamped row must fall back to the whole roster')
 
   // Removing a directory withdraws the registration on the next pass.
   rmSync(join(root, 'delta'), { recursive: true, force: true })
